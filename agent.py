@@ -356,21 +356,22 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
 
 
 def format_observation(result: CommandResult) -> str:
-    return f"""COMMAND:
-{result.command}
-
-EXIT_CODE:
-{result.exit_code}
-
-DURATION_SECONDS:
-{result.duration_sec:.3f}
-
-STDOUT:
-{result.stdout}
-
-STDERR:
-{result.stderr}
-"""
+    parts = [
+        "COMMAND:",
+        result.command,
+        "",
+        "EXIT_CODE:",
+        str(result.exit_code),
+        "",
+        "DURATION_SECONDS:",
+        f"{result.duration_sec:.3f}",
+        "",
+        "STDOUT:",
+        result.stdout,
+    ]
+    if result.stderr.strip():
+        parts.extend(["", "STDERR:", result.stderr])
+    return "\n".join(parts) + "\n"
 
 
 # -----------------------------
@@ -663,6 +664,8 @@ def solve(
 
 def _looks_like_successful_test_output(observation: str) -> bool:
     lower = observation.lower()
+    exit_code = _extract_observation_exit_code(lower)
+    stderr_body = _extract_observation_section(lower, "stderr")
 
     bad_markers = [
         " failed",
@@ -673,23 +676,42 @@ def _looks_like_successful_test_output(observation: str) -> bool:
         "assertionerror",
         "syntaxerror",
         "exception",
-        "exit_code:\n1",
-        "exit_code:\n2",
-        "exit_code:\n124",
     ]
 
     good_markers = [
         " passed",
         " all passed",
-        " exit_code:\n0",
         "ok",
         "success",
     ]
 
+    if exit_code is not None and exit_code != 0:
+        return False
+
     has_good = any(marker in lower for marker in good_markers)
     has_bad = any(marker in lower for marker in bad_markers)
+    if stderr_body and any(marker in stderr_body for marker in bad_markers):
+        has_bad = True
 
-    return has_good and not has_bad
+    return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
+def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
+    match = re.search(r"(?m)^exit_code:\n(-?\d+)", observation_lower)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_observation_section(observation_lower: str, section: str) -> str:
+    match = re.search(
+        rf"(?ms)^{re.escape(section.lower())}:\n(.*?)(?:\n[a-z_]+:\n|\Z)",
+        observation_lower,
+    )
+    return match.group(1).strip() if match else ""
 
 
 # -----------------------------
