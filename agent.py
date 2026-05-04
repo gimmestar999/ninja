@@ -93,6 +93,19 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
 MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
 
+REPO_CONTEXT_FILES = (
+    "README.md",
+    "README.rst",
+    "README.txt",
+    "pyproject.toml",
+    "package.json",
+    "setup.py",
+    "requirements.txt",
+    "pytest.ini",
+    "tox.ini",
+    "Makefile",
+)
+
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
 DANGEROUS_PATTERNS = [
@@ -210,6 +223,17 @@ def _repo_path(path: str | Path) -> Path:
     if not p.is_dir():
         raise NotADirectoryError(f"repo_path is not a directory: {p}")
     return p
+
+
+def _read_repo_file_preview(repo: Path, relative_path: str, max_chars: int = 4000) -> Optional[str]:
+    path = repo / relative_path
+    try:
+        if not path.is_file() or path.stat().st_size > 1_000_000:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    return _truncate(text, max_chars)
 
 
 # -----------------------------
@@ -483,6 +507,11 @@ def get_repo_summary(repo: Path) -> str:
     for cmd in commands:
         res = run_command(cmd, repo, timeout=10)
         parts.append(format_observation(res))
+
+    for relative_path in REPO_CONTEXT_FILES:
+        preview = _read_repo_file_preview(repo, relative_path)
+        if preview:
+            parts.append(f"FILE: {relative_path}\n{preview}")
 
     return "\n\n".join(parts)
 
