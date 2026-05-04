@@ -17,10 +17,7 @@ MARKER = "<!-- ninja-pr-scope-guard -->"
 DEFAULT_TRUSTED_AUTHORS = ("unarbos",)
 DEFAULT_EXTERNAL_ALLOWED_FILES = ("agent.py",)
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
-MINER_HOTKEY_TITLE_RE = re.compile(
-    r"\b(?:hkey|hotkey|miner)\s*[:=#-]?\s*([1-9A-HJ-NP-Za-km-z]{32,64})\b",
-    re.IGNORECASE,
-)
+MINER_HOTKEY_TITLE_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}(?:$|[\s:#-])")
 ALLOWED_ENV_NAMES = {
     "AGENT_MAX_STEPS",
     "AGENT_COMMAND_TIMEOUT",
@@ -176,9 +173,9 @@ def _csv_env(name: str, default: tuple[str, ...]) -> set[str]:
 
 
 def _title_violations(title: str) -> list[str]:
-    if MINER_HOTKEY_TITLE_RE.search(title):
+    if MINER_HOTKEY_TITLE_RE.match(title):
         return []
-    return ["PR title must include the committing miner hotkey, for example `hkey: <miner-hotkey>`."]
+    return ["PR title must start with the committing miner hotkey, for example `<miner-hotkey> improve solver`."]
 
 
 def _scope_violations(

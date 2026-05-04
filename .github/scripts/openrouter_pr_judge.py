@@ -25,10 +25,7 @@ DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_MAX_PATCH_CHARS = 120_000
 DEFAULT_MIN_SCORE = 70
 DEFAULT_OPENROUTER_ATTEMPTS = 3
-MINER_HOTKEY_TITLE_RE = re.compile(
-    r"\b(?:hkey|hotkey|miner)\s*[:=#-]?\s*([1-9A-HJ-NP-Za-km-z]{32,64})\b",
-    re.IGNORECASE,
-)
+MINER_HOTKEY_TITLE_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,64}(?:$|[\s:#-])")
 
 SYSTEM_PROMPT = """\
 You are a security-conscious CI judge for the public GitHub repo `unarbos/ninja`.
@@ -90,7 +87,7 @@ def main() -> int:
             body = _render_comment(result, model, min_score)
             _upsert_comment(token, repo, pr_number, body)
             _write_step_summary(body)
-            print("OpenRouter PR judge skipped: PR title does not include a miner hotkey.")
+            print("OpenRouter PR judge skipped: PR title does not start with a miner hotkey.")
             return 1
 
         openrouter_key = _required_env("OPENROUTER_API_KEY")
@@ -156,9 +153,9 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _title_fail_reasons(title: str) -> list[str]:
-    if MINER_HOTKEY_TITLE_RE.search(title):
+    if MINER_HOTKEY_TITLE_RE.match(title):
         return []
-    return ["PR title must include the committing miner hotkey, for example `hkey: <miner-hotkey>`."]
+    return ["PR title must start with the committing miner hotkey, for example `<miner-hotkey> improve solver`."]
 
 
 def _static_failure_result(fail_reasons: list[str], min_score: int) -> dict[str, Any]:
@@ -177,10 +174,10 @@ def _static_failure_result(fail_reasons: list[str], min_score: int) -> dict[str,
         "safety_score": 0,
         "scope_score": 0,
         "contract_score": 0,
-        "summary": "The LLM judge was not queried because the PR title is missing a miner hotkey.",
+        "summary": "The LLM judge was not queried because the PR title does not start with a miner hotkey.",
         "reasons": fail_reasons,
         "risks": ["Validator cannot bind this PR to an on-chain miner commitment."],
-        "required_changes": ["Retitle the PR with `hkey: <miner-hotkey>` matching the committing miner."],
+        "required_changes": ["Retitle the PR so it starts with `<miner-hotkey>` matching the committing miner."],
     }
     return {
         "final_verdict": "fail",
