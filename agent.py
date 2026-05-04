@@ -70,8 +70,8 @@ from typing import Any, Dict, List, Optional, Tuple
 # MINER-EDITABLE: You may tune local budgets like step count, command timeout,
 # observation size, and max_tokens. Do not set sampling parameters; the
 # validator proxy owns temperature/top-p/etc. and overwrites them server-side.
-DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "40"))
-DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "30"))
+DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "20"))
+DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
 # VALIDATOR CONTRACT: These defaults are only fallbacks for local testing and
 # validator wiring. During real validation the validator passes model, api_base,
@@ -89,8 +89,11 @@ DEFAULT_API_KEY = (
 )
 DEFAULT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 
-MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "12000"))
-MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "200000"))
+MAX_OBSERVATION_CHARS = int(os.environ.get("AGENT_MAX_OBSERVATION_CHARS", "9000"))
+MAX_TOTAL_LOG_CHARS = int(os.environ.get("AGENT_MAX_TOTAL_LOG_CHARS", "180000"))
+MAX_CONVERSATION_CHARS = int(os.environ.get("AGENT_MAX_CONVERSATION_CHARS", "60000"))
+MAX_NO_COMMAND_REPAIRS = int(os.environ.get("AGENT_MAX_NO_COMMAND_REPAIRS", "3"))
+MAX_COMMANDS_PER_RESPONSE = int(os.environ.get("AGENT_MAX_COMMANDS_PER_RESPONSE", "12"))
 
 # MINER-EDITABLE: You may make this command filter stricter or smarter. Do not
 # weaken it to run destructive host/container operations.
@@ -164,6 +167,40 @@ def _truncate(text: str, max_chars: int) -> str:
 def _safe_join_logs(logs: List[str]) -> str:
     joined = "\n".join(logs)
     return _truncate(joined, MAX_TOTAL_LOG_CHARS)
+
+
+def _message_chars(messages: List[Dict[str, str]]) -> int:
+    return sum(len(message.get("content") or "") + 32 for message in messages)
+
+
+def _messages_for_request(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if _message_chars(messages) <= MAX_CONVERSATION_CHARS:
+        return messages
+
+    head = messages[:2]
+    tail: List[Dict[str, str]] = []
+    budget = max(8000, MAX_CONVERSATION_CHARS - _message_chars(head) - 400)
+    used = 0
+    for message in reversed(messages[2:]):
+        size = len(message.get("content") or "") + 32
+        if tail and used + size > budget:
+            break
+        tail.append(message)
+        used += size
+    tail.reverse()
+
+    omitted = max(0, len(messages) - len(head) - len(tail))
+    if omitted == 0:
+        return messages
+    note = {
+        "role": "user",
+        "content": (
+            f"[{omitted} older interaction messages omitted to stay within the "
+            "time/token budget. Continue from the recent observations and make "
+            "the smallest useful patch.]"
+        ),
+    }
+    return [*head, note, *tail]
 
 
 def _normalize_api_base(api_base: str) -> str:
@@ -311,13 +348,7 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
             stderr=subprocess.PIPE,
             timeout=timeout,
             executable="/bin/bash",
-            env={
-                **os.environ,
-                "PYTHONUNBUFFERED": "1",
-                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-                "GIT_PAGER": "cat",
-                "PAGER": "cat",
-            },
+            env=_command_env(),
         )
 
         return CommandResult(
@@ -355,6 +386,20 @@ def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT)
         )
 
 
+def _command_env() -> Dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "HOME": os.environ.get("HOME", "/tmp") or "/tmp",
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp") or "/tmp",
+        "LANG": os.environ.get("LANG", "C.UTF-8") or "C.UTF-8",
+        "PYTHONUNBUFFERED": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "CI": "1",
+    }
+
+
 def format_observation(result: CommandResult) -> str:
     parts = [
         "COMMAND:",
@@ -382,11 +427,13 @@ ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOT
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
 
+def extract_commands(model_text: str) -> List[str]:
+    return [match.group(1).strip() for match in ACTION_RE.finditer(model_text) if match.group(1).strip()]
+
+
 def extract_command(model_text: str) -> Optional[str]:
-    match = ACTION_RE.search(model_text)
-    if not match:
-        return None
-    return match.group(1).strip()
+    commands = extract_commands(model_text)
+    return commands[0] if commands else None
 
 
 def extract_final(model_text: str) -> Optional[str]:
@@ -460,7 +507,36 @@ def get_patch(repo: Path) -> str:
         if file_diff.returncode in (0, 1):
             diff_output += file_diff.stdout or ""
 
-    return diff_output
+    return _strip_mode_only_file_diffs(diff_output)
+
+
+def _strip_mode_only_file_diffs(diff_output: str) -> str:
+    if not diff_output.strip():
+        return diff_output
+
+    blocks = re.split(r"(?=^diff --git )", diff_output, flags=re.MULTILINE)
+    kept: List[str] = []
+    for block in blocks:
+        if not block:
+            continue
+        mode_only = (
+            block.startswith("diff --git ")
+            and "\nold mode " in block
+            and "\nnew mode " in block
+            and "\n@@ " not in block
+            and "\nGIT binary patch" not in block
+            and "\nBinary files " not in block
+            and "\nnew file mode " not in block
+            and "\ndeleted file mode " not in block
+        )
+        if mode_only:
+            continue
+        kept.append(block)
+
+    result = "".join(kept)
+    if diff_output.endswith("\n") and result and not result.endswith("\n"):
+        result += "\n"
+    return result
 
 
 def _should_skip_patch_path(relative_path: str) -> bool:
@@ -473,7 +549,7 @@ def _should_skip_patch_path(relative_path: str) -> bool:
 def get_repo_summary(repo: Path) -> str:
     commands = [
         "pwd",
-        "find . -maxdepth 3 -type f | sed 's#^./##' | sort | head -200",
+        "git ls-files | awk 'NR<=220 {print} END {if (NR>220) print \"... \" NR-220 \" more tracked files\"}'",
         "git status --short || true",
     ]
 
@@ -494,11 +570,11 @@ def get_repo_summary(repo: Path) -> str:
 # validator-owned boundaries above.
 SYSTEM_PROMPT = """You are a coding agent running inside a repository.
 
-You must fix the issue by editing files in the repo.
+You must fix the issue by editing files in the repo. You have a tight wall-clock
+budget, so make a useful patch quickly instead of exhaustively exploring.
 
-You interact only by issuing bash commands. The environment will run your command and return stdout/stderr.
-
-Use this exact format when you want to run a command:
+You interact only by issuing bash commands. The environment will run your command
+and return stdout/stderr. Use this exact format when you want to run a command:
 
 <command>
 your bash command here
@@ -513,14 +589,23 @@ short summary of what you changed
 Rules:
 - Work directly in the repository.
 - Prefer small, targeted changes.
-- Inspect files before editing them.
-- Run relevant tests when possible.
+- Search first, then inspect only the relevant snippets before editing.
+- Spend at most 3 commands on broad inspection. By command 4 you should usually
+  be editing the most likely files.
+- Avoid dumping huge generated, minified, binary, lock, or vendored files.
+- Make edits as soon as the relevant code is clear.
+- Run the cheapest relevant verification you can. Prefer syntax/type/unit checks
+  for touched files over full installs, full builds, or broad test suites.
+- If dependencies are missing or a verification command is slow, keep the patch
+  and finish instead of spending the whole budget.
+- After a focused patch and one useful verification or diff review, finalize.
 - Do not use sudo.
 - Do not delete the repository.
 - Do not access secrets.
 - Do not make network calls except through the validator-provided inference proxy.
 - Do not modify hidden tests or evaluator files.
 - Do not stop after only explaining; actually edit the code.
+- Avoid chmod/file mode changes and unrelated formatting churn.
 - You may use python scripts, sed, cat, grep, find, pytest, npm, etc. if available.
 """
 
@@ -534,19 +619,29 @@ Repository summary:
 
 {repo_summary}
 
-Start by inspecting the relevant files. Then edit the repo and run tests.
+Start by locating the relevant files with search/listing commands. Inspect the
+smallest useful snippets, then make the best focused patch you can. Do not run
+a broad test suite before editing. After a patch exists, run one cheap
+verification if possible, then finish with <final>...</final>.
 """
 
 
 def build_no_command_repair_prompt() -> str:
     return """Your previous response did not contain a valid <command>...</command> block or <final>...</final> block.
 
-Continue by issuing exactly one bash command in this format:
+If the patch is complete, respond with <final>summary</final>. Otherwise continue
+by issuing exactly one bash command in this format:
 
 <command>
 your command here
 </command>
 """
+
+
+def build_budget_pressure_prompt(step: int) -> str:
+    if step < 6:
+        return """Budget check: you have not changed the repo yet. Your next command should edit the most likely file(s), using the issue plus the snippets already observed. Avoid more broad exploration."""
+    return """Hard budget check: there is still no patch. Your next command must create a minimal best-effort code change for the clearest acceptance criterion. Do not run tests or inspect more files until after a patch exists."""
 
 
 # -----------------------------
@@ -575,6 +670,7 @@ def solve(
     logs: List[str] = []
     total_cost: Optional[float] = 0.0
     success = False
+    consecutive_no_command = 0
 
     try:
         repo = _repo_path(repo_path)
@@ -592,7 +688,7 @@ def solve(
 
             try:
                 response_text, cost, _raw = chat_completion(
-                    messages=messages,
+                    messages=_messages_for_request(messages),
                     model=model_name,
                     api_base=api_base,
                     api_key=api_key,
@@ -606,35 +702,76 @@ def solve(
 
             logs.append("MODEL_RESPONSE:\n" + response_text)
 
+            commands = extract_commands(response_text)
             final = extract_final(response_text)
-            if final is not None:
-                logs.append("\nFINAL_SUMMARY:\n" + final)
-                success = True
-                break
 
-            command = extract_command(response_text)
-
-            if command is None:
+            if not commands:
+                if final is not None:
+                    logs.append("\nFINAL_SUMMARY:\n" + final)
+                    success = True
+                    break
+                consecutive_no_command += 1
+                patch = get_patch(repo)
+                if patch.strip():
+                    logs.append("\nPATCH_READY:\nModel stopped issuing commands after creating a patch.")
+                    success = True
+                    break
+                if consecutive_no_command >= MAX_NO_COMMAND_REPAIRS:
+                    logs.append("\nSTOPPED:\nModel repeatedly failed to produce a command or final answer.")
+                    break
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": build_no_command_repair_prompt()})
                 continue
 
-            result = run_command(command, repo, timeout=command_timeout)
-            observation = format_observation(result)
-
-            logs.append("\nOBSERVATION:\n" + observation)
-
+            consecutive_no_command = 0
             messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": observation})
+            observations: List[str] = []
+            command_batch = commands[:MAX_COMMANDS_PER_RESPONSE]
 
-            if step >= 6:
-                patch = get_patch(repo)
-                if patch.strip() and _looks_like_successful_test_output(observation):
-                    logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
-                    success = True
-                    break
+            for command_index, command in enumerate(command_batch, 1):
+                result = run_command(command, repo, timeout=command_timeout)
+                observation = format_observation(result)
+                observations.append(f"OBSERVATION {command_index}/{len(command_batch)}:\n{observation}")
+                logs.append(f"\nOBSERVATION {command_index}/{len(command_batch)}:\n" + observation)
+
+                if step >= 4 or command_index > 1:
+                    patch = get_patch(repo)
+                    if patch.strip() and _looks_like_successful_test_output(observation, command):
+                        logs.append("\nAUTO_STOP:\nPatch exists and latest command looked like successful tests.")
+                        success = True
+                        break
+                    if patch.strip() and result.timed_out:
+                        logs.append("\nPATCH_READY:\nPatch exists and latest command exceeded the local command timeout.")
+                        success = True
+                        break
+                    if patch.strip() and step >= 8 and _looks_like_patch_review_command(command, result):
+                        logs.append("\nPATCH_READY:\nPatch exists and latest command reviewed the diff/status.")
+                        success = True
+                        break
+
+            if len(commands) > len(command_batch):
+                observations.append(
+                    f"NOTE: Only the first {len(command_batch)} command blocks were executed. "
+                    "Continue with one command at a time if more work remains."
+                )
+
+            if final is not None and get_patch(repo).strip():
+                logs.append("\nFINAL_SUMMARY:\n" + final)
+                success = True
+
+            if observations:
+                messages.append({"role": "user", "content": "\n\n".join(observations)})
+
+            if success:
+                break
+
+            if not get_patch(repo).strip() and step in {4, 6}:
+                messages.append({"role": "user", "content": build_budget_pressure_prompt(step)})
 
         patch = get_patch(repo)
+        if patch.strip() and not success:
+            logs.append("\nPATCH_RETURN:\nReturning the best patch produced within the step budget.")
+            success = True
         step_count = len([x for x in logs if x.startswith("\n\n===== STEP")])
         return AgentResult(
             patch=patch,
@@ -662,7 +799,7 @@ def solve(
         ).to_dict()
 
 
-def _looks_like_successful_test_output(observation: str) -> bool:
+def _looks_like_successful_test_output(observation: str, command: str = "") -> bool:
     lower = observation.lower()
     exit_code = _extract_observation_exit_code(lower)
     stderr_body = _extract_observation_section(lower, "stderr")
@@ -693,7 +830,42 @@ def _looks_like_successful_test_output(observation: str) -> bool:
     if stderr_body and any(marker in stderr_body for marker in bad_markers):
         has_bad = True
 
+    if exit_code == 0 and _looks_like_verification_command(command) and not has_bad:
+        return True
+
     return (exit_code == 0 or has_good) and has_good and not has_bad
+
+
+def _looks_like_verification_command(command: str) -> bool:
+    lowered = command.lower()
+    patterns = [
+        r"\bpython\d*(\.\d+)?\s+-m\s+pytest\b",
+        r"\bpytest\b",
+        r"\bpython\d*(\.\d+)?\s+-m\s+py_compile\b",
+        r"\bnpm\s+(test|run\s+(test|build|lint|typecheck|check))\b",
+        r"\bpnpm\s+(test|run\s+(test|build|lint|typecheck|check)|exec\s+tsc)\b",
+        r"\byarn\s+(test|run\s+(test|build|lint|typecheck|check))\b",
+        r"\bnpx\s+tsc\b",
+        r"\btsc\b",
+        r"\bgo\s+test\b",
+        r"\bcargo\s+(test|check|clippy|build)\b",
+        r"\bmvn\s+test\b",
+        r"\bgradle(w)?\s+test\b",
+        r"\bmake\s+(test|check|lint)\b",
+        r"\bruff\b",
+        r"\beslint\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def _looks_like_patch_review_command(command: str, result: CommandResult) -> bool:
+    if result.exit_code != 0:
+        return False
+    lowered = command.lower().strip()
+    return bool(
+        re.search(r"\bgit\s+(diff|status)\b", lowered)
+        or re.search(r"\bgit\s+show\s+--stat\b", lowered)
+    )
 
 
 def _extract_observation_exit_code(observation_lower: str) -> Optional[int]:
