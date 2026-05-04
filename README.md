@@ -12,9 +12,9 @@ The validator imports `agent.py` and calls:
 solve(
     repo_path="/tmp/task_repo",
     issue="Fix the bug...",
-    model="...",
-    api_base="https://...",
-    api_key="...",
+    model="validator-managed-model",
+    api_base="http://validator-proxy/v1",
+    api_key="per-run-proxy-token",
 )
 ```
 
@@ -31,8 +31,14 @@ solve(
 ```
 
 The starter implementation is intentionally a single Python file with no
-external Python dependencies. It uses an OpenAI-compatible
+external Python dependencies. It uses the validator-provided OpenAI-compatible
 `/v1/chat/completions` endpoint and a bash action loop.
+
+Miners should not add their own OpenRouter/OpenAI keys or hardcode a model.
+The validator passes a managed model id, proxy URL, and per-run proxy token into
+`solve(...)`. That proxy is where request limits, token limits, costs, and model
+routing are enforced. In production, every miner agent should hit this same
+inference surface rather than choosing its own provider or model.
 
 ## Editing
 
@@ -45,9 +51,9 @@ Useful local environment variables:
 ```bash
 AGENT_MAX_STEPS=40
 AGENT_COMMAND_TIMEOUT=30
-AGENT_MODEL=gpt-4o-mini
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_API_KEY=...
+AGENT_MODEL=validator-managed-model
+OPENAI_BASE_URL=http://validator-proxy/v1
+OPENAI_API_KEY=per-run-proxy-token
 AGENT_TEMPERATURE=0
 AGENT_MAX_TOKENS=2048
 ```
