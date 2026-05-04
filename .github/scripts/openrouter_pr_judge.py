@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -23,6 +24,7 @@ DEFAULT_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_MAX_PATCH_CHARS = 120_000
 DEFAULT_MIN_SCORE = 70
+DEFAULT_OPENROUTER_ATTEMPTS = 3
 
 SYSTEM_PROMPT = """\
 You are a security-conscious CI judge for the public GitHub repo `unarbos/ninja`.
@@ -257,6 +259,7 @@ def _judge_with_openrouter(api_key: str, model: str, pr_payload: dict[str, Any])
     base = os.environ.get("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE).rstrip("/")
     url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
     max_tokens = _int_env("OPENROUTER_MAX_TOKENS", 1800)
+    attempts = _int_env("OPENROUTER_ATTEMPTS", DEFAULT_OPENROUTER_ATTEMPTS)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -280,6 +283,23 @@ def _judge_with_openrouter(api_key: str, model: str, pr_payload: dict[str, Any])
         "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "https://github.com/unarbos/ninja"),
         "X-Title": os.environ.get("OPENROUTER_APP_NAME", "ninja-pr-judge"),
     }
+
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            data = _openrouter_json(url, headers, payload)
+            content = _message_content(data)
+            return _parse_json_object(content)
+        except (KeyError, IndexError, RuntimeError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            print(f"OpenRouter judge response was unusable on attempt {attempt}; retrying: {exc}")
+            time.sleep(attempt)
+    raise RuntimeError(f"OpenRouter judge did not return usable JSON after {attempts} attempts: {last_error}")
+
+
+def _openrouter_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> dict[str, Any]:
     req = urllib.request.Request(
         url=url,
         data=json.dumps(payload).encode("utf-8"),
@@ -292,9 +312,29 @@ def _judge_with_openrouter(api_key: str, model: str, pr_payload: dict[str, Any])
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"OpenRouter request failed with HTTP {exc.code}: {error_body}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("OpenRouter response must be a JSON object")
+    return data
 
-    content = data["choices"][0]["message"]["content"]
-    return _parse_json_object(content)
+
+def _message_content(data: dict[str, Any]) -> str:
+    choice = data["choices"][0]
+    message = choice["message"]
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(str(item))
+        joined = "\n".join(part for part in parts if part.strip())
+        if joined.strip():
+            return joined
+    finish_reason = choice.get("finish_reason")
+    raise RuntimeError(f"OpenRouter returned empty message content; finish_reason={finish_reason}")
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
