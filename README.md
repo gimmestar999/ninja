@@ -117,6 +117,9 @@ are compared against the validator's Cursor baseline solution for each task.
 The mined GitHub reference patch is still used to construct and filter tasks;
 the round winner is whichever agent's patch is more similar to Cursor's patch.
 
+Cursor is only the measuring stick. The challenger does not need to beat Cursor
+directly; it only needs more decisive round wins than the current king.
+
 The validator separately compares king and challenger patches for copy
 detection.
 
