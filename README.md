@@ -101,6 +101,11 @@ first characters in the title.
 github-pr:unarbos/ninja#<pr-number>@<head-sha>
 ```
 
+Only one commitment per miner hotkey is eligible in each 24h window. The
+validator measures the window as 7,200 chain blocks from the last accepted
+commitment for that hotkey. A newer commitment made before that window expires
+is skipped.
+
 The validator binds the PR to the committing hotkey by checking that the PR
 title starts with the same hotkey that made the on-chain commitment. It also
 checks that the committed SHA matches the current PR head SHA.
