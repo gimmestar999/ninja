@@ -17,6 +17,10 @@ MARKER = "<!-- ninja-pr-scope-guard -->"
 DEFAULT_TRUSTED_AUTHORS = ("unarbos",)
 DEFAULT_EXTERNAL_ALLOWED_FILES = ("agent.py",)
 REQUIRED_SOLVE_ARGS = ("repo_path", "issue", "model", "api_base", "api_key")
+MINER_HOTKEY_TITLE_RE = re.compile(
+    r"\b(?:hkey|hotkey|miner)\s*[:=#-]?\s*([1-9A-HJ-NP-Za-km-z]{32,64})\b",
+    re.IGNORECASE,
+)
 ALLOWED_ENV_NAMES = {
     "AGENT_MAX_STEPS",
     "AGENT_COMMAND_TIMEOUT",
@@ -99,6 +103,7 @@ def main() -> int:
 
         pr = event["pull_request"]
         pr_number = int(pr["number"])
+        title = str(pr.get("title") or "")
         author = str((pr.get("user") or {}).get("login") or "")
         trusted_authors = _csv_env("TRUSTED_PR_AUTHORS", DEFAULT_TRUSTED_AUTHORS)
         allowed_files = _csv_env("EXTERNAL_PR_ALLOWED_FILES", DEFAULT_EXTERNAL_ALLOWED_FILES)
@@ -114,7 +119,10 @@ def main() -> int:
             print(f"Trusted PR author {author}; external file-scope guard bypassed.")
             return 0
 
-        contract_violations = _agent_contract_violations(token, files)
+        contract_violations = [
+            *_title_violations(title),
+            *_agent_contract_violations(token, files),
+        ]
         if scope_violations or contract_violations:
             body = _render_comment(
                 "fail",
@@ -165,6 +173,12 @@ def _csv_env(name: str, default: tuple[str, ...]) -> set[str]:
     if not parsed:
         raise RuntimeError(f"{name} must contain at least one value")
     return parsed
+
+
+def _title_violations(title: str) -> list[str]:
+    if MINER_HOTKEY_TITLE_RE.search(title):
+        return []
+    return ["PR title must include the committing miner hotkey, for example `hkey: <miner-hotkey>`."]
 
 
 def _scope_violations(

@@ -25,6 +25,10 @@ DEFAULT_OPENROUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_MAX_PATCH_CHARS = 120_000
 DEFAULT_MIN_SCORE = 70
 DEFAULT_OPENROUTER_ATTEMPTS = 3
+MINER_HOTKEY_TITLE_RE = re.compile(
+    r"\b(?:hkey|hotkey|miner)\s*[:=#-]?\s*([1-9A-HJ-NP-Za-km-z]{32,64})\b",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """\
 You are a security-conscious CI judge for the public GitHub repo `unarbos/ninja`.
@@ -75,17 +79,26 @@ def main() -> int:
         event = _load_event()
         repo = _required_env("GITHUB_REPOSITORY")
         token = _required_env("GITHUB_TOKEN")
-        openrouter_key = _required_env("OPENROUTER_API_KEY")
         model = DEFAULT_OPENROUTER_MODEL
 
         pr = event["pull_request"]
         pr_number = int(pr["number"])
+        min_score = _int_env("JUDGE_MIN_SCORE", DEFAULT_MIN_SCORE)
+        title_fail_reasons = _title_fail_reasons(str(pr.get("title") or ""))
+        if title_fail_reasons:
+            result = _static_failure_result(title_fail_reasons, min_score)
+            body = _render_comment(result, model, min_score)
+            _upsert_comment(token, repo, pr_number, body)
+            _write_step_summary(body)
+            print("OpenRouter PR judge skipped: PR title does not include a miner hotkey.")
+            return 1
+
+        openrouter_key = _required_env("OPENROUTER_API_KEY")
         patch = _github_text(token, f"/repos/{repo}/pulls/{pr_number}", "application/vnd.github.v3.diff")
         files = _fetch_pr_files(token, repo, pr_number)
         static = _static_checks(files)
 
         max_patch_chars = _int_env("JUDGE_MAX_PATCH_CHARS", DEFAULT_MAX_PATCH_CHARS)
-        min_score = _int_env("JUDGE_MIN_SCORE", DEFAULT_MIN_SCORE)
         truncated_patch = _truncate(patch, max_patch_chars)
 
         judgment = _judge_with_openrouter(
@@ -140,6 +153,44 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
+
+
+def _title_fail_reasons(title: str) -> list[str]:
+    if MINER_HOTKEY_TITLE_RE.search(title):
+        return []
+    return ["PR title must include the committing miner hotkey, for example `hkey: <miner-hotkey>`."]
+
+
+def _static_failure_result(fail_reasons: list[str], min_score: int) -> dict[str, Any]:
+    static = {
+        "fail_reasons": fail_reasons,
+        "warnings": [],
+        "findings": fail_reasons,
+        "changed_files": [],
+        "substantive_agent_lines": 0,
+        "total_changed_lines": 0,
+    }
+    judgment = {
+        "verdict": "fail",
+        "overall_score": 0,
+        "real_edit_score": 0,
+        "safety_score": 0,
+        "scope_score": 0,
+        "contract_score": 0,
+        "summary": "The LLM judge was not queried because the PR title is missing a miner hotkey.",
+        "reasons": fail_reasons,
+        "risks": ["Validator cannot bind this PR to an on-chain miner commitment."],
+        "required_changes": ["Retitle the PR with `hkey: <miner-hotkey>` matching the committing miner."],
+    }
+    return {
+        "final_verdict": "fail",
+        "score": 0,
+        "min_score": min_score,
+        "static": static,
+        "judgment": judgment,
+        "fail_reasons": fail_reasons,
+        "warnings": [],
+    }
 
 
 def _github_json(token: str, path: str, method: str = "GET", payload: Any | None = None) -> Any:
