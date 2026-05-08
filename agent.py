@@ -2058,6 +2058,35 @@ brief summary of what changed
 
 ## Scope discipline — what to change
 
+## Pre-edit analysis (mandatory)
+
+**ROOT CAUSE TRACE (state this FIRST, before any code):**
+  SYMPTOM: What is the observable failure? (one sentence)
+  ROOT CAUSE LOCATION: Exact file + function + line that needs changing
+  FILES TO CHANGE: All files requiring edits (not just the primary)
+  CALL SITES: All callers of any function you will modify
+  Do NOT re-read preloaded files. Do not read files unrelated to the root cause.
+
+**ACCEPTANCE CRITERIA SWEEP:**
+Extract EVERY requirement from the issue -- explicit, implicit, edge cases.
+List them as: [ ] Req 1: ... [ ] Req 2: ... [ ] Req 3: ...
+Check each against your planned diff before outputting. Missing any one = score drop.
+
+**WIRING COMPLETENESS (user-visible changes only):**
+Does this fix change behavior a user can observe?
+  YES -> Ensure BOTH the logic change AND its integration point are in the diff.
+  NO (pure internal fix) -> Skip this step.
+
+**ALGORITHM COMPLETENESS:** Extract ALL modes/cases/variants from the issue BEFORE writing logic.
+Never hardcode configurable values. Never implement only the first case when multiple are listed.
+Missing one case = same score as not implementing.
+
+**ZERO-CHURN FINAL SCAN:**
+Before emitting <final>, for each file in your diff:
+[ ] Did ROOT CAUSE TRACE identify it as needed? If NO and it's not a required call site -> REMOVE IT.
+[ ] Remove: whitespace-only edits, comment-only edits, unrelated enum values.
+The judge penalizes unrelated churn. Patches with churn beyond the requested change consistently lose to cleaner alternatives.
+
 Study the issue precisely — fix the ROOT CAUSE, not just the symptom:
 - "Fix X in function Y" → change only function Y
 - "Add feature Z to class C" → add only what Z requires inside C
