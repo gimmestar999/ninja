@@ -2928,11 +2928,18 @@ def _v54_emergency_solve(
     target = _v54_pick_target(repo, issue_text)
     if not target:
         return ""
+    # Sanity cap: only run the emergency rewrite when the chosen file's stem
+    # also appears in the issue text. Prevents writing wholesale new content
+    # to a file the issue never named.
+    target_stem = Path(target).stem.lower()
+    if target_stem and len(target_stem) >= 3 and target_stem not in issue_text.lower():
+        return ""
     full = repo / target
     try:
-        snippet = full.read_text(encoding="utf-8", errors="replace")[:2000]
+        original_full = full.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+    snippet = original_full[:2000]
     issue_short = issue_text[:1200]
     prompt = (
         f"Make the smallest possible code edit to {target} that addresses this issue.\n"
@@ -2966,6 +2973,14 @@ def _v54_emergency_solve(
         new_content = "\n".join(lines)
     if not new_content or new_content == snippet:
         return ""
+    # Sanity cap: refuse drastically different file size. The LLM should make a
+    # focused edit, not generate a wholly new file. Bound the new content to a
+    # 0.5x-2x window of the original full content.
+    orig_len = len(original_full)
+    if orig_len > 0:
+        new_len = len(new_content)
+        if new_len > orig_len * 2 + 256 or new_len * 2 + 256 < orig_len:
+            return ""
     try:
         full.write_text(new_content, encoding="utf-8")
     except Exception:
