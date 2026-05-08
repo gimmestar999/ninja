@@ -3128,7 +3128,7 @@ def _v14_grounded_score(repo_root: Path, issue_text: str, patch_text: str) -> fl
 # uses _MULTISHOT_MIN_ATTEMPT_RESERVE; this only relaxes the early-exit gate
 # inside _solve_attempt for tasks that genuinely need more steps.
 _LARGE_ISSUE_HEURISTIC_RE = re.compile(
-    r"\b(tests/|test classes|fixture|milestones|seed|catalogue|40\+ rows|version\.php)\b",
+    r"\b(tests/|test classes|fixture|milestones|catalogue|40\+ rows|version\.php)\b",
     re.IGNORECASE,
 )
 
