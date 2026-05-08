@@ -116,6 +116,7 @@ MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
 MAX_VISIBLE_SURFACE_NUDGES = 1  # catch UI-language issues whose patch only edits support code
+MAX_CASCADE_NUDGES = 1     # nudge when a modified-signature callable has unupdated callers
 MAX_HAIL_MARY_TURNS = 1    # last-resort: force a real edit when patch is empty after everything
 MAX_TOTAL_REFINEMENT_TURNS = 2  # ninjaking66 PR#268 insight: chained refinements blow time budget;
                                 # cap total refinement turns across all gates (hail-mary excepted)
@@ -1230,6 +1231,82 @@ def _visible_surface_missing(issue_text: str, patch: str) -> bool:
     return support_only
 
 
+# Cascade-coverage gate: when the patch changes signature lines (def /
+# function / class / interface / fn), find files in the unpatched repo
+# that reference those names but aren't in the patch — likely unupdated
+# consumers. Signature shapes for Python/JS/TS/Go/Rust/C#/Java.
+_CASCADE_SIG_RE = re.compile(
+    r"^[+\-]\s*(?:async\s+|public\s+|private\s+|protected\s+|static\s+|export\s+|"
+    r"const\s+|let\s+|var\s+)*"
+    r"(?:def|function|fn|class|interface|struct|enum|trait)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]{3,})\b"
+)
+_CASCADE_NAME_SKIP = frozenset({
+    "main", "init", "setup", "teardown", "test", "tests",
+    "constructor", "render", "default", "Component", "Default",
+})
+_CASCADE_MAX_NAMES_TO_PROBE = 5  # cap probes — each is a git grep
+_CASCADE_MAX_CALLERS_PER_NAME = 4  # truncate caller list shown in prompt
+
+
+def _modified_callable_names(patch: str) -> List[str]:
+    """Identifier names appearing in changed signature lines of the patch."""
+    if not patch:
+        return []
+    seen: set = set()
+    out: List[str] = []
+    for line in patch.splitlines():
+        if not line.startswith(("+", "-")) or line.startswith(("+++", "---")):
+            continue
+        m = _CASCADE_SIG_RE.match(line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name in _CASCADE_NAME_SKIP:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _cascade_gap_callers(repo: Path, patch: str) -> List[Tuple[str, List[str]]]:
+    """Return ``[(modified_callable_name, [caller_files_outside_patch])]``."""
+    names = _modified_callable_names(patch)[:_CASCADE_MAX_NAMES_TO_PROBE]
+    if not names:
+        return []
+    patched_files = set(_patch_changed_files(patch))
+    out: List[Tuple[str, List[str]]] = []
+    for name in names:
+        try:
+            proc = subprocess.run(
+                ["git", "grep", "-l", "-F", "--", name + "("],
+                cwd=str(repo),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=4,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in (0, 1):
+            continue
+        callers: List[str] = []
+        for line in proc.stdout.splitlines():
+            f = line.strip()
+            if not f or f in patched_files:
+                continue
+            if not _context_file_allowed(f):
+                continue
+            callers.append(f)
+            if len(callers) >= _CASCADE_MAX_CALLERS_PER_NAME:
+                break
+        if callers:
+            out.append((name, callers))
+    return out
+
+
 # -----------------------------
 # Multi-language syntax gate
 # -----------------------------
@@ -2255,6 +2332,29 @@ def build_visible_surface_nudge_prompt(issue_text: str) -> str:
     )
 
 
+def build_cascade_gap_prompt(name_to_callers: List[Tuple[str, List[str]]]) -> str:
+    """Refinement prompt naming callable signatures whose consumers in
+    other files do not appear in the current patch."""
+    bullets: List[str] = []
+    for name, callers in name_to_callers[:6]:
+        sample = ", ".join(callers[:4])
+        bullets.append(f"- `{name}` is referenced in {len(callers)}+ unpatched file(s): {sample}")
+    block = "\n  ".join(bullets) or "(none)"
+    return (
+        "Cascade-coverage gap — your patch modifies these callable(s)' "
+        "signature or definition, but their consumers in other files are "
+        "NOT in the current patch:\n"
+        f"  {block}\n\n"
+        "For each, decide: (a) the callers are correct as-is (e.g., "
+        "backward-compatible default args, or internal-only change) -> "
+        "respond with <final>summary</final> and explain; (b) the callers "
+        "DO need updating (signature, behavior, or rename change) -> "
+        "issue the additional edit commands for those caller files, then "
+        "end with <final>summary</final>. Do NOT add scope unrelated to "
+        "the cascade. Match the existing style of each caller file."
+    )
+
+
 def build_hail_mary_prompt(issue_text: str) -> str:
     """Last-resort refinement when the patch is STILL empty after every other
     refinement turn. Closes the architectural hole at maybe_queue_refinement's
@@ -2513,6 +2613,117 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
+# Emergency single-shot fallback: when the first attempt is empty AND
+# budget is too small for a full retry, a fast single-shot rewrite of the
+# most issue-relevant file beats giving up empty-handed. Sanity-capped:
+# chosen file's stem must literally appear in the issue, new content must
+# stay within roughly 0.5x to 2x of original size.
+
+def _v54_score_path_against_issue(path: str, issue_lower: str) -> int:
+    score = 0
+    name = path.rsplit("/", 1)[-1].lower()
+    base = name.rsplit(".", 1)[0]
+    if name and name in issue_lower:
+        score += 5
+    if base and len(base) > 2 and base in issue_lower:
+        score += 3
+    parts = [p for p in path.lower().split("/") if p]
+    for p in parts:
+        if len(p) > 3 and p in issue_lower:
+            score += 1
+    return score
+
+
+def _v54_pick_target(repo: Path, issue_text: str) -> Optional[str]:
+    issue_lower = issue_text.lower()
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files"],
+            cwd=str(repo), capture_output=True, text=True, timeout=8, check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    best_path: Optional[str] = None
+    best_score = 0
+    for line in proc.stdout.splitlines():
+        path = line.strip()
+        if not path:
+            continue
+        if any(seg in path for seg in ("__pycache__/", "node_modules/", ".git/", "dist/", "build/")):
+            continue
+        if path.endswith((".pyc", ".lock", ".min.js", ".min.css")):
+            continue
+        s = _v54_score_path_against_issue(path, issue_lower)
+        if s > best_score:
+            best_score = s
+            best_path = path
+    return best_path if best_score > 0 else None
+
+
+def _v54_emergency_solve(
+    *,
+    repo: Path,
+    issue_text: str,
+    model: Optional[str],
+    api_base: Optional[str],
+    api_key: Optional[str],
+    deadline: float,
+) -> str:
+    target = _v54_pick_target(repo, issue_text)
+    if not target:
+        return ""
+    issue_lower = issue_text.lower()
+    target_stem = target.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+    if len(target_stem) < 3 or target_stem not in issue_lower:
+        return ""
+    full = repo / target
+    try:
+        original_full = full.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    snippet = original_full[:2000]
+    issue_short = issue_text[:1200]
+    prompt = (
+        f"Make the smallest possible code edit to {target} that addresses this issue.\n"
+        f"Output ONLY the new content of the file, nothing else, no markdown fences, "
+        f"no explanation. The file must remain syntactically valid.\n\n"
+        f"ISSUE:\n{issue_short}\n\nCURRENT FILE CONTENT (first 2000 chars):\n{snippet}\n"
+    )
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining < 5.0:
+        return ""
+    try:
+        text, _, _ = chat_completion(
+            messages=[
+                {"role": "system", "content": "You output ONLY the new file content. No markdown."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model, api_base=api_base, api_key=api_key,
+            max_tokens=1024, timeout=int(remaining), max_retries=0,
+        )
+    except Exception:
+        return ""
+    new_content = text.strip()
+    if new_content.startswith("```"):
+        lines = new_content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        new_content = "\n".join(lines)
+    if not new_content or new_content == original_full:
+        return ""
+    if len(new_content) > len(original_full) * 2 + 256 or len(new_content) * 2 + 256 < len(original_full):
+        return ""
+    try:
+        full.write_text(new_content, encoding="utf-8")
+        return get_patch(repo)
+    except Exception:
+        return ""
+
+
 # -----------------------------
 # Main agent (v28 — multi-shot wrapper around _solve_inner)
 # -----------------------------
@@ -2555,6 +2766,21 @@ def solve(
 
     _elapsed = time.monotonic() - _multishot_started
     if (_multishot_total_budget - _elapsed) < _MULTISHOT_MIN_ATTEMPT_RESERVE:
+        # When retry is skipped due to time AND first attempt is empty,
+        # try a fast single-shot on the most issue-relevant file. Sanity
+        # caps in _v54_emergency_solve prevent writing to unrelated files.
+        _emerg_remaining = _multishot_total_budget - _elapsed
+        if _emerg_remaining > 8.0 and _n1 == 0:
+            _emerg_patch = _v54_emergency_solve(
+                repo=_multishot_repo_obj,
+                issue_text=issue,
+                model=model, api_base=api_base, api_key=api_key,
+                deadline=time.monotonic() + min(_emerg_remaining - 2.0, 45.0),
+            )
+            if _emerg_patch:
+                _result1["patch"] = _emerg_patch
+                _result1["success"] = True
+                _result1["multishot_emergency"] = True
         _result1["multishot_attempts"] = 1
         _result1["multishot_skipped_retry"] = "insufficient_time"
         return _result1
@@ -2603,6 +2829,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
     coverage_nudges_used = 0
     criteria_nudges_used = 0
     visible_surface_nudges_used = 0
+    cascade_nudges_used = 0
     hail_mary_turns_used = 0
     total_refinement_turns_used = 0  # ninjaking66 PR#268: total cap across all gates (hail-mary excluded)
     consecutive_model_errors = 0
@@ -2635,7 +2862,7 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
         (we know the patch parses) but BEFORE coverage/criteria/self-check
         (those are heuristic; test is ground truth from a real runner).
         """
-        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, hail_mary_turns_used, total_refinement_turns_used
+        nonlocal polish_turns_used, self_check_turns_used, syntax_fix_turns_used, test_fix_turns_used, coverage_nudges_used, criteria_nudges_used, visible_surface_nudges_used, cascade_nudges_used, hail_mary_turns_used, total_refinement_turns_used
         patch = get_patch(repo)
 
         # v20 edge — close the architectural hole at the empty-patch early
@@ -2748,6 +2975,21 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 "VISIBLE_SURFACE_NUDGE_QUEUED",
             )
             return True
+
+        # Cascade-gap gate: when the patch changes a callable's signature,
+        # check whether its consumers in OTHER files are being updated too.
+        if cascade_nudges_used < MAX_CASCADE_NUDGES:
+            cascade_gaps = _cascade_gap_callers(repo, patch)
+            if cascade_gaps:
+                cascade_nudges_used += 1
+                total_refinement_turns_used += 1
+                queue_refinement_turn(
+                    assistant_text,
+                    build_cascade_gap_prompt(cascade_gaps),
+                    "CASCADE_NUDGE_QUEUED:\n  "
+                    + " | ".join(f"{n} -> {len(callers)} caller(s)" for n, callers in cascade_gaps[:3]),
+                )
+                return True
 
         if self_check_turns_used < MAX_SELF_CHECK_TURNS:
             self_check_turns_used += 1
