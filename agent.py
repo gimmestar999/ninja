@@ -114,6 +114,7 @@ MAX_SELF_CHECK_TURNS = 1   # ensure issue-mentioned paths are covered, no scope 
 MAX_SYNTAX_FIX_TURNS = 1   # repair Python/TypeScript/JavaScript SyntaxError
 MAX_LINT_TURNS = 1         # v72: ruff/eslint pass — judge prefers lint-clean code
 _LINT_TIMEOUT = 10         # v72: per-file ruff/eslint timeout
+_FORMAT_TIMEOUT = 8        # v74: per-file auto-format (ruff format / prettier) timeout
 MAX_TEST_FIX_TURNS = 1     # repair the companion test we ran ourselves
 MAX_COVERAGE_NUDGES = 1    # tell model which issue-mentioned paths are still untouched
 MAX_CRITERIA_NUDGES = 1    # tell model which issue acceptance-criteria look unaddressed
@@ -1271,6 +1272,102 @@ def _check_syntax(repo: Path, patch: str) -> List[str]:
 # v72: lint integration ported from PR559 (UID 154). Project-style lint compliance
 # matters to the LLM judge — clean ruff/eslint output reads as "production code"
 # while warnings make the patch look unfinished.
+
+def _organize_imports_python(repo: Path, relative_path: str) -> bool:
+    """v75: run ruff's import-sorter (`ruff check --select I --fix`) on a
+    Python file before format/lint. Same semantic-neutral cleanup as
+    `ruff format` but targeted specifically at PEP 8 import grouping
+    (stdlib / third-party / local, alphabetical within each group). The
+    change is semantically a no-op — Python evaluates imports order-
+    independently outside pathological cases the sorter already declines
+    to touch — so this only narrows the visible diff to logic-only edits.
+    """
+    if not _has_executable("ruff"):
+        return False
+    proc = run_command(
+        f"ruff check --select I --fix --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_FORMAT_TIMEOUT,
+    )
+    # ruff check exits 0 on clean, 1 on remaining issues; both mean it ran.
+    return proc.exit_code in (0, 1)
+
+
+def _autoformat_python(repo: Path, relative_path: str) -> bool:
+    """v74: run `ruff format` on a Python file before the lint check.
+
+    The formatter is purely cosmetic: it normalizes whitespace, quote
+    style, and line continuations to the project's canonical layout. By
+    running it before the existing v72 lint gate, the lint pass surfaces
+    only real issues (unused imports, undefined names, etc.) rather than
+    warnings about whitespace or quoting that the formatter could already
+    fix on its own.
+
+    v75: this is now the SECOND step of the pre-lint pipeline; the
+    import sorter (`_organize_imports_python`) runs first so the
+    formatter sees already-grouped imports.
+    """
+    if not _has_executable("ruff"):
+        return False
+    proc = run_command(
+        f"ruff format --quiet {_shell_quote(relative_path)}",
+        repo,
+        timeout=_FORMAT_TIMEOUT,
+    )
+    return proc.exit_code == 0
+
+
+def _autoformat_js(repo: Path, relative_path: str) -> bool:
+    """v74: run prettier on a JS/TS file when the project ships prettier locally.
+
+    Skips when prettier is not on PATH and no local `node_modules` install
+    exists, so we never depend on global state. Same rationale as
+    `_autoformat_python` — normalize purely cosmetic differences before
+    running the lint check, so the lint pass only flags real issues.
+    """
+    local_prettier = repo / "node_modules" / ".bin" / "prettier"
+    if local_prettier.exists():
+        cmd = f"./node_modules/.bin/prettier --write --log-level=silent {_shell_quote(relative_path)}"
+    elif _has_executable("prettier"):
+        cmd = f"prettier --write --log-level=silent {_shell_quote(relative_path)}"
+    else:
+        return False
+    proc = run_command(cmd, repo, timeout=_FORMAT_TIMEOUT)
+    return proc.exit_code == 0
+
+
+def _autoformat_touched(repo: Path, patch: str) -> int:
+    """v74/v75: best-effort cleanup pass on every touched file before lint runs.
+
+    For Python files the pipeline is now:
+      1. `_organize_imports_python` — sort imports into PEP 8 groups (v75)
+      2. `_autoformat_python` — canonical whitespace/quotes (v74)
+
+    For JS/TS files: `_autoformat_js` (prettier) when locally available.
+
+    Returns the count of files actually touched by at least one pass. The
+    lint pass that follows then operates on canonical code, so the only
+    reported issues are real problems rather than whitespace/import-order
+    churn the cleanup steps could have fixed on their own. Both steps are
+    semantically no-ops, so this cannot introduce regressions; it only
+    narrows the visible diff to logic-only changes the LLM judges can
+    actually evaluate.
+    """
+    formatted = 0
+    for relative_path in _patch_changed_files(patch):
+        suffix = Path(relative_path).suffix.lower()
+        ok = False
+        if suffix == ".py":
+            # Order matters: sort imports first so the formatter sees a
+            # canonical block, then run the formatter to lock in whitespace.
+            ok = _organize_imports_python(repo, relative_path) or ok
+            ok = _autoformat_python(repo, relative_path) or ok
+        elif suffix in {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}:
+            ok = _autoformat_js(repo, relative_path)
+        if ok:
+            formatted += 1
+    return formatted
+
 
 def _check_lint_python(repo: Path, relative_path: str) -> Optional[str]:
     """v72: run `ruff check` on a Python file. Returns the first issue or None."""
@@ -2931,6 +3028,23 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                     "SYNTAX_FIX_QUEUED:\n  " + "\n  ".join(syntax_errors),
                 )
                 return True
+
+        # v74/v75: auto-format every touched file before the lint check.
+        # Cleanup is purely cosmetic (sorts imports, normalizes whitespace
+        # and quoting; never changes semantics) so it silently absorbs
+        # churn that would otherwise show up as lint warnings the model
+        # has to fix in its own turn. Net effect: when `lint_errors`
+        # comes back, the entries are real problems (unused imports,
+        # undefined names) rather than noise the cleanup steps could
+        # have already handled.
+        if lint_turns_used < MAX_LINT_TURNS:
+            try:
+                _autoformat_touched(repo, patch)
+                # Re-extract patch after formatter; behavior is identical but
+                # the textual diff may now be tighter.
+                patch = get_patch(repo) or patch
+            except Exception:
+                pass
 
         # v72: lint pass — runs ruff/eslint when project tooling is available.
         # Different axis from syntax (which proves the file parses); lint
