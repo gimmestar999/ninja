@@ -1906,6 +1906,7 @@ First response format:
 - Requirement: restate every explicit issue requirement.
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
+- Coverage breadth: name every file the issue mentions PLUS every integration file needed for the change to actually work end-to-end (route registry, app entry, parent component, schema/migration, exports, imports, call sites). Each must appear in your patch.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -1945,6 +1946,20 @@ Patch the owner of the behavior, not a downstream symptom. Parser rejects valid 
 Never hardcode the visible example unless the issue explicitly requests that exact special case. Hidden tests usually check the general behavior, not the literal example.
 
 When several fixes are correct, choose the one that changes fewest files, smallest owning function, matches nearby style, preserves public API, uses existing helpers, and looks like the obvious five-minute maintainer patch.
+
+====================================================================
+INTEGRATION COMPLETENESS — wire what you add
+====================================================================
+
+A patch that adds new code MUST also wire it in. Before <final>, verify:
+
+- Imports: every identifier referenced in your added lines exists somewhere imported. New helpers/types/components consumed in another file must be imported there. NameError / ReferenceError / "is not defined" at runtime is the most common reason a new patch is ranked below the king.
+- Exports: if you added a function, class, component, or constant that another file should consume, export it from the source module (named export, default export, `__all__`, package `index.ts`, or whatever the file's existing convention is).
+- Registries / routes / app entries: if you added a route, page, slot, handler, command, listener, or component that the app surfaces to users, register it in the relevant `routes.ts` / `App.tsx` / `urls.py` / `__init__.py` / config / index — wherever the existing entries live.
+- Schema / migrations: if you added a field, table, column, env var, or config key, every consumer of that schema must accept the new shape. Update the migration script, the type definition, the example config, the docs section that lists keys.
+- Call sites: when you changed a signature, type, or contract, every call site in the same response — leaving the tree half-edited is the most common reason a build breaks after a "complete" patch.
+
+The empirical pattern: a challenger ADDS new code; the king ADDS-AND-WIRES. The diff judge consistently ranks added-and-wired above only-added. Wired beats added.
 
 ====================================================================
 SURGICAL EDITING
