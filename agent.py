@@ -2038,6 +2038,7 @@ First response format:
 - Requirement: restate every secondary clause, edge case, “also”, “and”, “unless”, “only”, “should not”, or acceptance criterion.
 - Requirement: if the issue uses numbered bullets or checkbox lines, mirror each item as its own plan row.
 - Integration cascade: if the issue describes a feature spanning multiple concerns (page + route + nav + data fetch; or model + migration + serializer + view + URL), enumerate EVERY required integration point as its own plan row even when the issue does not explicitly bullet them.
+- No-stub rule: every new function/method/component you add must have a complete body — no `pass` / `TODO` / `raise NotImplementedError` / `// implementation goes here` / empty-bracket placeholders. Stub-and-defer is the most-dinged "incomplete" pattern; the diff judge ranks a partial-but-fully-implemented patch above a complete-shape-but-stubbed one.
 - Likely target: name likely files/functions/classes/modules to inspect or modify.
 - Strategy: smallest root-cause fix likely to satisfy the issue.
 - Verification: targeted test command expected after patching.
@@ -2585,7 +2586,22 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         _multishot_total_budget = _MULTISHOT_TOTAL_BUDGET
         _multishot_initial_head = _multishot_capture_head(_multishot_repo_obj) if _multishot_repo_obj else None
 
-        _result1 = _solve_attempt(**kwargs)
+        # let retry fire if attempt 1 crashes
+        try:
+            _result1 = _solve_attempt(**kwargs)
+        except Exception as _exc1:
+            _result1 = {
+                "patch": "",
+                "logs": f"INNER_ATTEMPT1_ERROR: {type(_exc1).__name__}: {str(_exc1)[:300]}",
+                "steps": 0,
+                "cost": 0.0,
+                "success": False,
+            }
+            try:
+                if _multishot_repo_obj is not None:
+                    _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
+            except Exception:
+                pass
         _patch1 = _result1.get("patch", "") or ""
         _n1 = _multishot_count_substantive(_patch1)
 
@@ -2601,7 +2617,16 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
 
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
-        _result2 = _solve_attempt(**kwargs)
+        try:
+            _result2 = _solve_attempt(**kwargs)
+        except Exception as _exc2:
+            _result2 = {
+                "patch": "",
+                "logs": f"INNER_ATTEMPT2_ERROR: {type(_exc2).__name__}: {str(_exc2)[:300]}",
+                "steps": 0,
+                "cost": 0.0,
+                "success": False,
+            }
         _patch2 = _result2.get("patch", "") or ""
         _n2 = _multishot_count_substantive(_patch2)
 
