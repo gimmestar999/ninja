@@ -943,10 +943,17 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
+    # TSX app-router safety net: halve preload caps on Next.js app-router repos.
+    preload_files_cap = MAX_PRELOADED_FILES
+    preload_chars_cap = MAX_PRELOADED_CONTEXT_CHARS
+    if _repo_is_tsx_app_router(list(tracked_set)):
+        preload_files_cap = max(6, MAX_PRELOADED_FILES // 2)
+        preload_chars_cap = max(20000, MAX_PRELOADED_CONTEXT_CHARS // 2)
+
     parts: List[str] = []
     included: List[str] = []
     used = 0
-    per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
+    per_file_budget = max(1500, preload_chars_cap // max(1, min(len(files), preload_files_cap)))
 
     if rescue_files:
         # Banner is small and high-leverage; surface BEFORE the snippet
@@ -964,19 +971,19 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(rescue_banner)
         used += len(rescue_banner)
 
-    for relative_path in files[:MAX_PRELOADED_FILES]:
+    for relative_path in files[:preload_files_cap]:
         snippet = _read_context_file(repo, relative_path, per_file_budget)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
-        if parts and used + len(block) > MAX_PRELOADED_CONTEXT_CHARS:
+        if parts and used + len(block) > preload_chars_cap:
             break
         parts.append(block)
         included.append(relative_path)
         used += len(block)
 
     project_hints = _project_hint_block(repo)
-    if project_hints and used + len(project_hints) <= MAX_PRELOADED_CONTEXT_CHARS + 1200:
+    if project_hints and used + len(project_hints) <= preload_chars_cap + 1200:
         parts.append(project_hints)
         used += len(project_hints)
 
@@ -984,7 +991,7 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     # no-op when the repo has no real history (pilot snapshots have one
     # synthetic commit) — the helper returns "" and we add nothing.
     recent_examples = _recent_commit_examples(repo)
-    if recent_examples and used + len(recent_examples) <= MAX_PRELOADED_CONTEXT_CHARS + _RECENT_COMMIT_BLOCK_BUDGET:
+    if recent_examples and used + len(recent_examples) <= preload_chars_cap + _RECENT_COMMIT_BLOCK_BUDGET:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
@@ -1218,6 +1225,26 @@ def _augment_with_integration_partners(files: List[str], tracked: set, issue: st
             augmented.append(relative_path)
             seen.add(relative_path)
     return augmented
+
+
+_TSX_APP_ROUTER_MIN_TSX_FILES = 5
+
+
+def _repo_is_tsx_app_router(tracked: List[str]) -> bool:
+    """Detect Next.js / React app-router repos with parenthesised route
+    segments and bracketed dynamic params. On these, halve preload caps
+    to free wall budget (docker_solver SIGKILL hazard on large TSX repos)."""
+    tsx_count = 0
+    saw_app_router_segment = False
+    for path in tracked:
+        if path.endswith(".tsx") or path.endswith(".ts"):
+            tsx_count += 1
+        if not saw_app_router_segment:
+            if "/(" in path and ")/" in path:
+                saw_app_router_segment = True
+            elif "/[" in path and "]/" in path:
+                saw_app_router_segment = True
+    return saw_app_router_segment and tsx_count >= _TSX_APP_ROUTER_MIN_TSX_FILES
 
 
 def _tracked_files(repo: Path) -> List[str]:
