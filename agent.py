@@ -64,10 +64,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# -----------------------------
-# Config
-# -----------------------------
-
 DEFAULT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "30"))
 DEFAULT_COMMAND_TIMEOUT = int(os.environ.get("AGENT_COMMAND_TIMEOUT", "15"))
 
@@ -96,10 +92,6 @@ MAX_NO_COMMAND_REPAIRS = 2
 MAX_COMMANDS_PER_RESPONSE = 15
 
 # Anti-whiff knobs. Empty patches score zero on baseline-similarity, so any
-# transient model error or stuck loop directly costs us rounds. Be aggressive
-# about retrying instead of returning early with no edits.
-# Hardcoded — not user-tunable. The PR Scope Guard's env-var allowlist
-# (pr_scope_guard.py:ALLOWED_ENV_NAMES) does not permit new AGENT_* names.
 HTTP_MAX_RETRIES = 3
 HTTP_RETRY_BASE_BACKOFF = 1.0
 MAX_STEP_RETRIES = 2
@@ -128,12 +120,6 @@ MAX_TOTAL_REFINEMENT_TURNS = 3  # ninjaking66 PR#268 insight: chained refinement
 _STYLE_HINT_BUDGET = 600   # VladaWebDev PR#250: cap on detected-style block in preloaded context
 
 # Recent-commit injection: small in-context style anchors from the staged repo's
-# real history. The validator clones the real repo with full git history; the
-# pilot stages snapshots with one synthetic commit so this is a no-op locally
-# but high-leverage live. Recent commits are concrete examples of this
-# codebase's style — showing the model 1-2 actual examples teaches the codebase's
-# idioms (variable conventions, hunk shape, test-touch patterns) far better than
-# any abstract prompt rule.
 _RECENT_COMMIT_MAX_INSERTIONS = 30
 _RECENT_COMMIT_MAX_DIFF_CHARS = 3500
 _RECENT_COMMIT_BLOCK_BUDGET = 4500
@@ -172,10 +158,6 @@ DANGEROUS_PATTERNS = [
 ]
 
 
-# -----------------------------
-# Data structures
-# -----------------------------
-
 @dataclass
 class CommandResult:
     command: str
@@ -204,10 +186,6 @@ class AgentResult:
             "success": self.success,
         }
 
-
-# -----------------------------
-# Utility
-# -----------------------------
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -306,14 +284,6 @@ def _repo_path(path: str | Path) -> Path:
     return p
 
 
-# -----------------------------
-# OpenAI-compatible client
-# -----------------------------
-
-# MINER-EDITABLE WITH BOUNDARIES: You may change request formatting, retry
-# behavior, response parsing, or model-message strategy here. Keep all requests
-# pointed at the api_base/api_key supplied by solve(); the validator proxy
-# rewrites the model and sampling parameters server-side.
 def chat_completion(
     messages: List[Dict[str, str]],
     model: str,
@@ -390,14 +360,6 @@ def chat_completion(
     return content, cost, data
 
 
-# -----------------------------
-# Shell execution
-# -----------------------------
-
-# MINER-EDITABLE: This is the bash tool surface your agent uses inside the task
-# repo. You may improve command validation, environment handling, timeouts, and
-# output shaping. Keep commands scoped to the repo and avoid secrets or network
-# access outside the validator inference proxy.
 def run_command(command: str, cwd: Path, timeout: int = DEFAULT_COMMAND_TIMEOUT) -> CommandResult:
     command = command.strip()
 
@@ -504,10 +466,6 @@ def format_observation(result: CommandResult) -> str:
     return "\n".join(parts) + "\n"
 
 
-# -----------------------------
-# Action parsing
-# -----------------------------
-
 ACTION_RE = re.compile(r"<command>\s*(.*?)\s*</command>", re.IGNORECASE | re.DOTALL)
 FINAL_RE = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
 
@@ -527,10 +485,6 @@ def extract_final(model_text: str) -> Optional[str]:
         return None
     return match.group(1).strip()
 
-
-# -----------------------------
-# Git helpers
-# -----------------------------
 
 def ensure_git_repo(repo: Path) -> None:
     git_dir = repo / ".git"
@@ -924,12 +878,6 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     tracked_set = set(_tracked_files(repo))
 
     # Rescue-ranker: weak top_score means no path mention and no symbol-grep
-    # hit landed, so the top-ranked file is essentially random — this is
-    # the dominant catastrophic-floor failure mode. Run a cheap broad-grep
-    # over the full tracked set (no context-file filter) and surface the
-    # 1-3 files that match the most issue terms. Also surface a banner
-    # block in the preload so the model treats those files as the most
-    # likely targets rather than guessing from path-mention-style cues.
     rescue_files: List[str] = []
     if top_score < _RESCUE_RANKER_TOP_SCORE_THRESHOLD:
         rescue_files = _broad_grep_fallback(repo, issue, tracked_set)
@@ -943,16 +891,16 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
     files = _augment_with_test_partners(files, tracked_set)
     files = _augment_with_integration_partners(files, tracked_set, issue)
 
+    # Needles + 2x budget for path-mentioned files.
+    needles = _preload_needles(issue)
+    path_mentioned = {p.strip("./") for p in _extract_issue_path_mentions(issue)}
+
     parts: List[str] = []
     included: List[str] = []
     used = 0
     per_file_budget = max(1500, MAX_PRELOADED_CONTEXT_CHARS // max(1, min(len(files), MAX_PRELOADED_FILES)))
 
     if rescue_files:
-        # Banner is small and high-leverage; surface BEFORE the snippet
-        # blocks so the model reads it before any file content. Marker
-        # comments are stable so _strip_preloaded_section keeps treating
-        # this block correctly.
         rescue_banner = (
             "### rescue-ranker hint\n"
             "The issue does not directly name a file or identifier present in "
@@ -965,7 +913,8 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         used += len(rescue_banner)
 
     for relative_path in files[:MAX_PRELOADED_FILES]:
-        snippet = _read_context_file(repo, relative_path, per_file_budget)
+        file_budget = per_file_budget * 2 if relative_path in path_mentioned else per_file_budget
+        snippet = _read_context_file(repo, relative_path, file_budget, needles=needles)
         if not snippet.strip():
             continue
         block = f"### {relative_path}\n```\n{snippet}\n```"
@@ -988,6 +937,52 @@ def build_preloaded_context(repo: Path, issue: str) -> Tuple[str, List[str]]:
         parts.append(recent_examples)
 
     return "\n\n".join(parts), included
+
+
+# Needle-based context windowing: extract regions around issue-matching lines.
+_QUOTED_NEEDLE_RE = re.compile(r'["\']([^"\']{4,80})["\']')
+_FENCED_CODE_RE = re.compile(r"```[A-Za-z]*\n(.*?)```", re.DOTALL)
+
+
+def _preload_needles(issue: str) -> List[str]:
+    out: List[str] = []
+    seen: set = set()
+
+    def add(token: str) -> None:
+        if not token:
+            return
+        key = token.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(token)
+
+    for sym in _extract_issue_symbols(issue):
+        add(sym)
+    for mention in _extract_issue_path_mentions(issue):
+        stem = Path(mention).stem
+        if stem and len(stem) >= 3:
+            add(stem)
+    for quoted in _QUOTED_NEEDLE_RE.findall(issue):
+        if not any(c.isalpha() for c in quoted):
+            continue
+        if len(quoted.split()) > 8:
+            continue
+        add(quoted.strip())
+    for block in _FENCED_CODE_RE.findall(issue):
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if len(line) < 8 or len(line) > 120:
+                continue
+            if not any(c.isalnum() for c in line):
+                continue
+            if line.startswith(("#", "//", "/*", "*")):
+                continue
+            add(line)
+    for term in _issue_terms(issue):
+        if len(term) >= 4:
+            add(term)
+    return out
 
 
 _BACKTICK_IDENT_RE = re.compile(r"`([A-Za-z][\w./_-]{2,60})`")
@@ -1017,12 +1012,6 @@ def _rank_context_files(repo: Path, issue: str) -> Tuple[List[str], int]:
             mentioned.append(normalized)
 
     # Backtick-wrapped identifiers in issues (e.g. `send-expiry-emails`,
-    # `email_notificacoes`) are deliberate signals from the task author about
-    # the code surface that matters. When they pick out a small specific set
-    # of tracked files by path-substring, treat those files as explicit
-    # mentions so they get the same +100 ranking boost as path-mentioned
-    # files. Skipped when the identifier matches too many files (filters out
-    # generic identifiers like `basic.py` or `any2txt`).
     seen_mentioned = set(mentioned)
     for ident in set(_BACKTICK_IDENT_RE.findall(issue)):
         matches = [p for p in tracked_set if ident in p and _context_file_allowed(p)]
@@ -1300,7 +1289,12 @@ def _issue_terms(issue: str) -> List[str]:
     return terms[:40]
 
 
-def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
+def _read_context_file(
+    repo: Path,
+    relative_path: str,
+    max_chars: int,
+    needles: Optional[List[str]] = None,
+) -> str:
     path = (repo / relative_path).resolve()
     try:
         path.relative_to(repo.resolve())
@@ -1313,23 +1307,78 @@ def _read_context_file(repo: Path, relative_path: str, max_chars: int) -> str:
     if b"\0" in data[:4096]:
         return ""
     text = data.decode("utf-8", errors="replace")
+    if needles:
+        return _extract_relevant_regions(text, needles, max_chars)
     return _truncate(text, max_chars)
 
 
-# -----------------------------
-# Hunk classifiers + diff hygiene
-# -----------------------------
-#
-# Two failure modes produce low-quality patches: drive-by whitespace /
-# comment / blank-line edits, and patches that cover the wrong files. The
-# helpers below detect both. They're applied at two stages:
-#
-#   1. At patch-return time: low-signal hunks are silently dropped from the
-#      final diff (so the validator never sees them).
-#   2. Inside the loop: when the model's draft contains junk, we queue a
-#      "polish" turn that asks the model to revert those hunks itself, since
-#      doing so cleanly is safer than mechanical filtering for borderline cases
-#      (e.g., a comment edit that genuinely matters).
+def _extract_relevant_regions(
+    text: str,
+    needles: List[str],
+    max_chars: int,
+    *,
+    ctx_before: int = 8,
+    ctx_after: int = 12,
+) -> str:
+    # Return line-numbered windows around needle-matching lines, capped at max_chars.
+    if not text:
+        return text
+    if len(text) <= max_chars:
+        return text
+
+    needles_lower: List[str] = []
+    seen: set = set()
+    for n in needles:
+        if not n:
+            continue
+        key = n.lower()
+        if len(key) < 3 or key in seen:
+            continue
+        seen.add(key)
+        needles_lower.append(key)
+    if not needles_lower:
+        return _truncate(text, max_chars)
+
+    lines = text.splitlines()
+    matched: List[int] = []
+    for i, line in enumerate(lines):
+        ll = line.lower()
+        if any(n in ll for n in needles_lower):
+            matched.append(i)
+
+    if not matched:
+        return _truncate(text, max_chars)
+
+    windows: List[Tuple[int, int]] = []
+    for i in matched:
+        start = max(0, i - ctx_before)
+        end = min(len(lines), i + ctx_after + 1)
+        if windows and start <= windows[-1][1]:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+
+    parts: List[str] = []
+    used = 0
+    total_lines = len(lines)
+    omitted = 0
+    for idx, (start, end) in enumerate(windows):
+        header = f"--- lines {start + 1}-{end} of {total_lines} ---"
+        body = "\n".join(f"{ln + 1:5d}| {lines[ln]}" for ln in range(start, end))
+        block = header + "\n" + body
+        if parts and used + len(block) + 2 > max_chars:
+            omitted = len(windows) - idx
+            break
+        parts.append(block)
+        used += len(block) + 2
+
+    if omitted > 0:
+        parts.append(
+            f"... [{omitted} more relevant region(s) omitted to stay within {max_chars} chars] ..."
+        )
+
+    return "\n\n".join(parts)
+
 
 _COMMENT_LINE_PREFIXES: Tuple[str, ...] = ("#", "//", ";", "--", "%")
 _BLOCK_COMMENT_RE = re.compile(r"^\s*(\*|/\*|\*/)")
@@ -1499,17 +1548,6 @@ def _uncovered_required_paths(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# -----------------------------
-# Multi-language syntax gate
-# -----------------------------
-#
-# The previous king's syntax check was Python-only. Real validator tasks come
-# from real GitHub commits, so a sizeable fraction touch TypeScript, JavaScript,
-# JSON, YAML, etc. This module checks each touched file with the cheapest
-# available tool, falling back gracefully when tools are missing. Errors come
-# back as (path:line: msg) strings so the syntax-fix prompt can quote them.
-
-
 _SYNTAX_TIMEOUT = 6  # per-file cap — enough for `node --check` on big files
 
 
@@ -1572,15 +1610,6 @@ def _check_json_syntax_one(repo: Path, relative_path: str) -> Optional[str]:
 
 
 # Languages where ' is unambiguously a string delimiter. The brace-balance
-# parser below treats ' as a string-mode toggle, which produces false
-# positives on:
-#   - C / C++ / C# / Java / Kotlin / Scala — `'X'` is a character literal
-#     (so `char c = '}';` flips into string mode and eats until next ')
-#   - Rust — `'a` is a lifetime annotation
-#   - Go — `'X'` is a rune literal
-# Net effect of including those: a single `'X'` in any function would yield
-# a phantom imbalance that triggers a wasted syntax_fix turn. We restrict
-# to JS-family + Swift, where ' is a real string delimiter.
 _BRACE_BALANCE_SUFFIXES = {
     ".ts", ".tsx", ".jsx", ".swift",
 }
@@ -1710,16 +1739,6 @@ def _shell_quote(value: str) -> str:
     """Single-quote-escape for embedding in a bash command string."""
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
-
-# -----------------------------
-# Companion-test discovery + execution
-# -----------------------------
-#
-# When the agent edits `src/foo.py` and a `tests/test_foo.py` exists in the
-# repo, running that test before <final> catches a class of regressions the
-# scope/judge gates can't see. Cursor's baseline diffs almost always update
-# tests in lockstep with source edits, and a fast pytest -k catches "I broke
-# the test I was supposed to fix."
 
 _TEST_PARTNER_TEMPLATES: Tuple[Tuple[str, str], ...] = (
     # Python — the most common shapes.
@@ -1964,12 +1983,6 @@ def _recent_commit_examples(repo: Path) -> str:
             if insertions == 0 or insertions > _RECENT_COMMIT_MAX_INSERTIONS:
                 continue
             # NOTE: previous version passed --pretty=format:%s which caused
-            # `git show` to emit the commit subject in place of the standard
-            # header but git still appended the diff. After the >=100 char
-            # filter the only commits that survived were those with very long
-            # subjects (e.g. squash messages); their wrapped output was a mix
-            # of subject + diff, which is noise. --pretty=format: empties the
-            # header entirely so we keep just the diff body.
             diff_proc = subprocess.run(
                 ["git", "show", "--no-merges", "--pretty=format:", sha],
                 cwd=str(repo),
@@ -2060,13 +2073,6 @@ def _criterion_keywords(criterion: str) -> List[str]:
 
 
 # Verb/noun suffixes commonly used in acceptance-criterion English that don't
-# appear in source-code identifiers. The criteria say "clicking", "loads",
-# "selection", "displayed", "correctly"; the corresponding code uses
-# `onClick`, `loadMessages`, `onSelect`, `display`, `correct`. A literal
-# substring check on the natural-language form misses these matches and
-# inflates the criteria-nudge false-positive rate. Stripping the suffix
-# (with a minimum-stem length to avoid false positives like `action`->`act`
-# matching `react`) bridges the natural-language ↔ identifier gap.
 _KEYWORD_SUFFIX_STRIPS = (("ing", 4), ("tion", 4), ("ion", 4), ("ed", 4), ("es", 4), ("ly", 4), ("s", 4))
 
 
@@ -2112,15 +2118,6 @@ def _unaddressed_criteria(patch: str, issue_text: str) -> List[str]:
     return missing
 
 
-# -----------------------------
-# Deletion-gap detection
-# -----------------------------
-#
-# Duel data shows the king loses rounds where the issue says "remove X" or
-# "delete Y" but the patch contains zero deletion lines — the model added
-# the new behaviour without removing the old one.  This gate detects that
-# mismatch cheaply and surfaces a targeted nudge before <final>.
-
 _DELETION_VERB_RE = re.compile(
     r"\b(remove|delete|drop|eliminate|deprecate|strip|replace|clear|unlink|erase|undo|disable|deactivate)\b",
     re.IGNORECASE,
@@ -2140,16 +2137,6 @@ def _issue_requires_deletion(issue_text: str) -> bool:
     """True if the issue contains explicit removal/replacement verbs."""
     return bool(_DELETION_VERB_RE.search(issue_text))
 
-
-# -----------------------------
-# Issue-symbol grep ranking
-# -----------------------------
-#
-# `_rank_context_files` already weighs files by issue-mentioned paths and term
-# overlap. For multi-file repos that's not enough — a one-line bug fix often
-# names a function or class without mentioning the file. We extract identifier-
-# shaped tokens from the issue and grep the repo for them; files that contain
-# those identifiers get a context-rank boost.
 
 _SYMBOL_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{2,})(?![A-Za-z0-9_])")
 _SYMBOL_STOP = {
@@ -2229,13 +2216,6 @@ def _symbol_grep_hits(
     return hits
 
 
-# -----------------------------
-# Prompting
-# -----------------------------
-
-# MINER-EDITABLE: This prompt is the main behavior policy for the inner coding
-# agent. Prompt improvements are encouraged as long as they respect the
-# validator-owned boundaries above.
 SYSTEM_PROMPT = '''You are an elite autonomous coding agent competing in a real GitHub issue repair benchmark.
 
 You operate inside a real repository. You inspect the codebase, produce a patch, and verify it. Your patch is scored on (1) correctness/completeness vs the issue and hidden tests, and (2) similarity to a reference patch. Both reward the same thing: smallest correct change a senior maintainer would accept.
@@ -2716,14 +2696,6 @@ def build_test_fix_prompt(test_path: str, output: str) -> str:
     )
 
 
-# -----------------------------
-# Main agent
-# -----------------------------
-
-# -----------------------------
-# v28 multi-shot helpers
-# -----------------------------
-
 _MULTISHOT_LOW_SIGNAL_THRESHOLD = 3
 # Tau docker_solver hard wall is max(per-task-timeout, 300s) from exec start.
 # A 580s outer budget invited "retry" starts with only seconds left, then the
@@ -2799,15 +2771,6 @@ def _multishot_apply_patch(repo: Path, patch_text: str) -> bool:
         return False
 
 
-# -----------------------------
-# Main agent (v28 — multi-shot wrapper around _solve_inner)
-# -----------------------------
-
-# MINER-EDITABLE: validator entry point. Multi-shot wrapper: same `solve(...)`
-# signature as upstream, but the body runs the inner attempt twice with
-# revert-and-retry on a low-signal first attempt. Inner attempt is dispatched
-# through **kwargs so the validator-protected parameter signature appears
-# only in `solve` itself (not duplicated in a helper).
 def solve(
     repo_path: str,
     issue: str,
@@ -2869,10 +2832,6 @@ def _solve_with_safety_net(**kwargs: Any) -> Dict[str, Any]:
         if _multishot_repo_obj is not None:
             _multishot_revert(_multishot_repo_obj, _multishot_initial_head)
         # Pass remaining multishot budget so attempt 2 can't overrun the docker
-        # hard wall.  Without this, attempt 2 inherits the full 248 s inner
-        # budget even when attempt 1 already consumed 100–130 s, pushing the
-        # combined runtime past the ~300 s docker hard wall → process killed,
-        # empty patch returned (confirmed timeout in duel #4558 round 064928).
         _remaining = _MULTISHOT_TOTAL_BUDGET - _elapsed
         _attempt2_budget = max(30.0, _remaining - _MULTISHOT_MIN_ATTEMPT_RESERVE)
         _bootstrap = build_attempt2_bootstrap(_result1, _n1)
@@ -3034,14 +2993,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
                 return True
 
         # Companion-test execution gate. The previous king alexlange1 (PR #44)
-        # shipped MAX_TEST_FIX_TURNS, build_test_fix_prompt, and the
-        # _TEST_PARTNER_TEMPLATES preloading list, but never invoked any of
-        # them from solve(). The +1269 line PR #185 rewrite kept the dead
-        # scaffolding without using it. We re-introduce the runtime
-        # correctness signal: if any edited file has a partner test that
-        # actually fails, surface the failure tail to the model as one fix
-        # turn. This is the only refinement step in the chain backed by a
-        # real runner rather than heuristics.
         if test_fix_turns_used < MAX_TEST_FIX_TURNS:
             failure = _select_companion_test_failure(repo, patch)
             if failure is not None:
@@ -3142,8 +3093,6 @@ def _solve_attempt(**kwargs: Any) -> Dict[str, Any]:
             {"role": "user", "content": _initial_user_content},
         ]
         initial_preload_stripped = False
-
-        _wall_start = time.monotonic()
 
         for step in range(1, max_steps + 1):
             logs.append(f"\n\n===== STEP {step} =====\n")
@@ -3445,13 +3394,6 @@ def _extract_observation_section(observation_lower: str, section: str) -> str:
     return match.group(1).strip() if match else ""
 
 
-# -----------------------------
-# CLI for local testing
-# -----------------------------
-
-# LOCAL TESTING ONLY: The validator imports solve() directly. You may adjust the
-# CLI to make local experiments easier, but do not rely on CLI-only behavior for
-# validation.
 def _parse_args(argv: List[str]) -> Dict[str, Any]:
     import argparse
 
